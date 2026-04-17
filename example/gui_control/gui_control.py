@@ -5,15 +5,20 @@ import time, json
 import threading
 from dataclasses import dataclass
 from typing import List, Dict
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QObject, QEvent
-from PyQt5.QtWidgets import (
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QObject, QEvent
+from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, 
     QSlider, QLabel, QPushButton, QGroupBox, QScrollArea, QTabWidget, 
     QFrame, QSplitter, QMessageBox, QTextEdit
 )
-from PyQt5.QtGui import QFont, QPainter, QColor, QBrush
-from PyQt5.QtCore import QRect
-from config.constants import _HAND_CONFIGS
+from PyQt6.QtGui import QFont, QPainter, QColor, QBrush
+from PyQt6.QtCore import QRect
+try:
+    from config.constants import _HAND_CONFIGS
+    from tactile_csv import append_tactile_csv_row, close_tactile_csv, create_tactile_csv_writer
+except ModuleNotFoundError:
+    from .config.constants import _HAND_CONFIGS
+    from .tactile_csv import append_tactile_csv_row, close_tactile_csv, create_tactile_csv_writer
 current_dir = os.path.dirname(os.path.abspath(__file__))
 target_dir = os.path.abspath(os.path.join(current_dir, "../.."))
 sys.path.append(target_dir)
@@ -61,7 +66,7 @@ class DotMatrixWidget(QWidget):
     def paintEvent(self, event):
         """绘制点阵"""
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
         # 绘制背景
         painter.fillRect(self.rect(), QColor('white'))
@@ -176,13 +181,13 @@ class MatrixDisplayWidget(QWidget):
         
         # 手指标签 - 居中显示
         label = QLabel(display_name)
-        label.setAlignment(Qt.AlignCenter)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setStyleSheet("font-weight: bold;")
         finger_layout.addWidget(label)
         
         # 创建点阵部件
         matrix = DotMatrixWidget()
-        finger_layout.addWidget(matrix, 0, Qt.AlignCenter)
+        finger_layout.addWidget(matrix, 0, Qt.AlignmentFlag.AlignCenter)
         
         self.finger_matrices[finger_name] = matrix
         return finger_frame
@@ -235,9 +240,16 @@ class HandApiManager(QObject):
 
     def __init__(self):
         super().__init__()
+        self.csv_record_button = None
         self.hand_joint = None
         self.hand_type = None
         self.api = None
+        self.is_recording_csv = False
+        self.tactile_csv_file = None
+        self.tactile_csv_writer = None
+        self.tactile_csv_path = None
+        self.tactile_csv_start_time = None
+        self.matrix_update_hz = 10
         self._init_linker_hand_type()
         # 初始化API
         self.init_api()
@@ -247,6 +259,7 @@ class HandApiManager(QObject):
         self.matrix_timer.timeout.connect(self.update_matrix_data)
         self.matrix_timer.start(500)  # 每500ms更新一次矩阵数据
         self.lock = False
+        self.matrix_timer.setInterval(int(1000 / self.matrix_update_hz))
 
     def _init_linker_hand_type(self):
         try:
@@ -292,6 +305,71 @@ class HandApiManager(QObject):
             self.status_updated.emit("error", f"API初始化失败: {str(e)}")
             raise
 
+    def start_csv_recording(self):
+        if self.is_recording_csv:
+            return self.tactile_csv_path
+        log_dir = os.path.join(current_dir, "logs")
+        self.tactile_csv_file, self.tactile_csv_writer, self.tactile_csv_path, self.tactile_csv_start_time = create_tactile_csv_writer(
+            base_dir=log_dir,
+            hand_side=self.hand_type,
+        )
+        self.is_recording_csv = True
+        self.status_updated.emit("info", f"开始录制CSV: {self.tactile_csv_path}")
+        return self.tactile_csv_path
+
+    def stop_csv_recording(self):
+        if not self.is_recording_csv:
+            return
+        close_tactile_csv(self.tactile_csv_file)
+        self.tactile_csv_file = None
+        self.tactile_csv_writer = None
+        self.tactile_csv_start_time = None
+        self.is_recording_csv = False
+        self.status_updated.emit("info", "已停止录制CSV")
+
+    def set_matrix_update_hz(self, hz: int):
+        hz = max(1, min(100, int(hz)))
+        self.matrix_update_hz = hz
+        self.matrix_timer.setInterval(max(1, int(1000 / hz)))
+        self.status_updated.emit("info", f"矩阵读取频率已设为 {hz} Hz")
+
+    def _flatten_debug_values(self, values):
+        if values is None:
+            return []
+        flattened = []
+        for item in values:
+            if hasattr(item, "tolist"):
+                item = item.tolist()
+            if isinstance(item, (list, tuple)):
+                for sub_item in item:
+                    if hasattr(sub_item, "item"):
+                        sub_item = sub_item.item()
+                    flattened.append(int(sub_item))
+            else:
+                if hasattr(item, "item"):
+                    item = item.item()
+                flattened.append(int(item))
+        return flattened
+
+    def _summarize_matrix_debug(self, matrix_data):
+        parts = []
+        for finger_key, finger_label in (
+            ("thumb_matrix", "thumb"),
+            ("index_matrix", "index"),
+            ("middle_matrix", "middle"),
+            ("ring_matrix", "ring"),
+            ("little_matrix", "little"),
+        ):
+            flattened = self._flatten_debug_values(matrix_data.get(finger_key))
+            if not flattened:
+                parts.append(f"{finger_label}:empty")
+                continue
+            nonzero_count = sum(1 for value in flattened if value != 0)
+            parts.append(
+                f"{finger_label}:min={min(flattened)},max={max(flattened)},sum={sum(flattened)},nonzero={nonzero_count}"
+            )
+        return " | ".join(parts)
+
     def update_matrix_data(self):
         """更新矩阵数据"""
         if not self.api:
@@ -315,9 +393,21 @@ class HandApiManager(QObject):
                     "ring_matrix": ring_data,
                     "little_matrix": little_data
                 }
-                
+
                 # 发送矩阵数据更新信号
+                self.status_updated.emit("info", f"矩阵调试: {self._summarize_matrix_debug(matrix_data)}")
                 self.matrix_data_updated.emit(matrix_data)
+                if self.is_recording_csv and self.tactile_csv_writer and self.tactile_csv_file:
+                    try:
+                        append_tactile_csv_row(
+                            writer=self.tactile_csv_writer,
+                            csv_file=self.tactile_csv_file,
+                            hand_side=self.hand_type,
+                            matrix_data=matrix_data,
+                            start_time=self.tactile_csv_start_time,
+                        )
+                    except Exception as csv_error:
+                        self.status_updated.emit("error", f"CSV写入失败: {str(csv_error)}")
                 
         except Exception as e:
             # 如果获取数据失败，发送空数据
@@ -406,6 +496,7 @@ class HandApiManager(QObject):
                 self.status_updated.emit("error", f"API关闭失败: {str(e)}")
         if self.matrix_timer.isActive():
             self.matrix_timer.stop()
+        self.stop_csv_recording()
 
 class HandControlGUI(QWidget):
     """灵巧手控制界面"""
@@ -541,7 +632,7 @@ class HandControlGUI(QWidget):
         main_layout = QVBoxLayout(self)
         
         # 创建水平分割器（原有三个面板）
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
         
         # 创建左侧关节控制面板
         self.joint_control_panel = self.create_joint_control_panel()
@@ -575,13 +666,13 @@ class HandControlGUI(QWidget):
         
         # 创建标题
         title_label = QLabel(f"关节控制 - {self.hand_joint}")
-        title_label.setFont(QFont("Microsoft YaHei", 14, QFont.Bold))
+        title_label.setFont(QFont("Microsoft YaHei", 14, QFont.Weight.Bold))
         layout.addWidget(title_label)
 
         # 创建滑动条滚动区域
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         
         scroll_content = QWidget()
         self.sliders_layout = QGridLayout(scroll_content)
@@ -615,7 +706,7 @@ class HandControlGUI(QWidget):
             label.setMinimumWidth(120)
             
             # 创建滑动条
-            slider = QSlider(Qt.Horizontal)
+            slider = QSlider(Qt.Orientation.Horizontal)
             slider.setRange(0, 255)
             slider.setValue(value)
             slider.valueChanged.connect(
@@ -663,6 +754,10 @@ class HandControlGUI(QWidget):
         self.stop_button.clicked.connect(self.on_stop_clicked)
         actions_layout.addWidget(self.stop_button)
         
+        self.csv_record_button = QPushButton("开始录制CSV")
+        self.csv_record_button.setProperty("category", "action")
+        self.csv_record_button.clicked.connect(self.on_csv_record_clicked)
+        actions_layout.addWidget(self.csv_record_button)
         layout.addLayout(actions_layout)
         
         return panel
@@ -694,7 +789,7 @@ class HandControlGUI(QWidget):
 
         # 标题
         title_label = QLabel("状态监控")
-        title_label.setFont(QFont("Microsoft YaHei", 14, QFont.Bold))
+        title_label.setFont(QFont("Microsoft YaHei", 14, QFont.Weight.Bold))
         layout.addWidget(title_label)
 
         # 快速设置
@@ -704,7 +799,7 @@ class HandControlGUI(QWidget):
         # 速度行
         speed_hbox = QHBoxLayout()
         speed_hbox.addWidget(QLabel("速度:"))
-        self.speed_slider = QSlider(Qt.Horizontal)
+        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
         self.speed_slider.setRange(0, 255)
         self.speed_slider.setValue(255)
         self.speed_slider.setMinimumWidth(150)
@@ -726,7 +821,7 @@ class HandControlGUI(QWidget):
         # 扭矩行
         torque_hbox = QHBoxLayout()
         torque_hbox.addWidget(QLabel("扭矩:"))
-        self.torque_slider = QSlider(Qt.Horizontal)
+        self.torque_slider = QSlider(Qt.Orientation.Horizontal)
         self.torque_slider.setRange(0, 255)
         self.torque_slider.setValue(255)
         self.torque_slider.setMinimumWidth(150)
@@ -744,6 +839,24 @@ class HandControlGUI(QWidget):
         torque_hbox.addWidget(self.torque_btn)
         torque_hbox.addStretch()
         qv_layout.addLayout(torque_hbox)
+
+        matrix_rate_hbox = QHBoxLayout()
+        matrix_rate_hbox.addWidget(QLabel("矩阵频率(Hz):"))
+        self.matrix_rate_slider = QSlider(Qt.Orientation.Horizontal)
+        self.matrix_rate_slider.setRange(1, 100)
+        self.matrix_rate_slider.setValue(self.api_manager.matrix_update_hz)
+        self.matrix_rate_slider.setMinimumWidth(150)
+        matrix_rate_hbox.addWidget(self.matrix_rate_slider)
+        self.matrix_rate_val_lbl = QLabel(str(self.api_manager.matrix_update_hz))
+        self.matrix_rate_val_lbl.setMinimumWidth(30)
+        matrix_rate_hbox.addWidget(self.matrix_rate_val_lbl)
+        self.matrix_rate_btn = QPushButton("设置频率")
+        self.matrix_rate_btn.clicked.connect(
+            lambda: self.api_manager.set_matrix_update_hz(self.matrix_rate_slider.value())
+        )
+        matrix_rate_hbox.addWidget(self.matrix_rate_btn)
+        matrix_rate_hbox.addStretch()
+        qv_layout.addLayout(matrix_rate_hbox)
 
         layout.addWidget(quick_set_gb)
 
@@ -804,6 +917,8 @@ class HandControlGUI(QWidget):
             lambda v: self.speed_val_lbl.setText(str(v)))
         self.torque_slider.valueChanged.connect(
             lambda v: self.torque_val_lbl.setText(str(v)))
+        self.matrix_rate_slider.valueChanged.connect(
+            lambda v: self.matrix_rate_val_lbl.setText(str(v)))
         return panel
 
     def create_value_display_panel(self):
@@ -882,6 +997,16 @@ class HandControlGUI(QWidget):
             self.reset_preset_buttons_color()
             
         self.status_updated.emit("warning", "已停止所有动作")
+
+    def on_csv_record_clicked(self):
+        if self.api_manager.is_recording_csv:
+            self.api_manager.stop_csv_recording()
+            if self.csv_record_button:
+                self.csv_record_button.setText("开始录制CSV")
+        else:
+            self.api_manager.start_csv_recording()
+            if self.csv_record_button:
+                self.csv_record_button.setText("停止录制CSV")
 
     def on_cycle_clicked(self):
         """循环运行预设动作按钮点击事件处理"""
@@ -1005,7 +1130,7 @@ def main():
         window.show()
         
         # 运行应用
-        exit_code = app.exec_()
+        exit_code = app.exec()
         
         # 清理
         api_manager.shutdown()
