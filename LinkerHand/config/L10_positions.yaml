@@ -83,23 +83,11 @@ LEFT_HAND:
   - 255
   - 255
   - 255
-- ACTION_NAME: shishi
-  POSITION:
-  - 85
-  - 30
-  - 255
-  - 0
-  - 0
-  - 255
-  - 0
-  - 0
-  - 0
-  - 66
 RIGHT_HAND:
 - ACTION_NAME: 张开
   POSITION:
   - 255
-  - 70
+  - 255
   - 255
   - 255
   - 255
@@ -144,3 +132,15 @@ RIGHT_HAND:
   - 255
   - 255
   - 121
+- ACTION_NAME: zhuadao_1
+  POSITION:
+  - 220
+  - 255
+  - 10
+  - 10
+  - 10
+  - 12
+  - 255
+  - 255
+  - 255
+  - 218
